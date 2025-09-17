@@ -4,6 +4,7 @@ import subprocess
 import asyncio
 import re
 import datetime
+from collections import defaultdict
 import msal
 import openpyxl
 from tqdm import tqdm
@@ -139,7 +140,13 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
 async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, url=None, retries=3):
     headers = {"Authorization": f"Bearer {token}"}
     if url is None:
-        url = f"https://graph.microsoft.com/v1.0/users/{mailbox_email}/mailFolders/{folder_id}/messages?$select=subject,receivedDateTime,body,hasAttachments,id,internetMessageHeaders,from"
+        url = (
+            "https://graph.microsoft.com/v1.0/users/"
+            f"{mailbox_email}/mailFolders/{folder_id}/messages"
+            "?$select=subject,receivedDateTime,hasAttachments,id,from,size"
+            "&$expand=attachments($select=size)"
+            "&$top=100"
+        )
 
     messages = []
 
@@ -149,34 +156,42 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
             break
         page_messages = data.get("value", [])
         for msg in page_messages:
-            msg_size, attachment_size = await estimate_message_size(session, token, mailbox_email, msg, semaphore, pbar)
-            msg["size"] = msg_size
+            attachments = msg.get("attachments", []) or []
+            attachment_size = sum(att.get("size", 0) for att in attachments)
             msg["attachment_size"] = attachment_size
+            if "attachments" in msg:
+                msg.pop("attachments", None)
         messages.extend(page_messages)
         pbar.update(len(page_messages))
         url = data.get("@odata.nextLink")
 
     return messages
 
-async def estimate_message_size(session, token, mailbox_email, message, semaphore, pbar=None):
-    body_content = message.get("body", {}).get("content", "")
-    body_size = len(body_content.encode('utf-8')) if body_content else 1024
-    attachment_size = await get_attachments_size(session, token, mailbox_email, message.get("id"), semaphore, pbar) if message.get("hasAttachments") else 0
-    header_size = sum(len(h.get("name", "").encode('utf-8')) + len(h.get("value", "").encode('utf-8')) for h in message.get("internetMessageHeaders", []))
-    total_size = body_size + attachment_size + header_size
-    return total_size, attachment_size
-
-async def get_attachments_size(session, token, mailbox_email, message_id, semaphore, pbar=None):
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://graph.microsoft.com/v1.0/users/{mailbox_email}/messages/{message_id}/attachments?$select=size"
-    data = await fetch(session, url, headers, semaphore, pbar=pbar)
-    if not data:
-        return 0
-    return sum(att.get("size", 0) for att in data.get("value", []))
-
 def sanitize_sheet_name(name: str) -> str:
     cleaned = re.sub(r'[\\/:\?\*\[\]]+', '_', name)
     return cleaned[:31] or "Folder"
+
+def build_monthly_summary(mailbox_data):
+    summary = defaultdict(lambda: {"message_count": 0, "message_size": 0, "attachment_size": 0})
+    for folder_path, messages in mailbox_data.items():
+        for msg in messages:
+            size_bytes = msg.get("size", 0) or 0
+            attachment_bytes = msg.get("attachment_size", 0) or 0
+            received_dt = msg.get("receivedDateTime")
+            month_key = "Nieznany"
+            if received_dt:
+                try:
+                    dt_str = received_dt.replace("Z", "")
+                    dt_obj = datetime.datetime.fromisoformat(dt_str)
+                    month_key = dt_obj.strftime("%Y-%m")
+                except ValueError:
+                    month_key = received_dt[:7]
+
+            summary[(folder_path, month_key)]["message_count"] += 1
+            summary[(folder_path, month_key)]["message_size"] += size_bytes
+            summary[(folder_path, month_key)]["attachment_size"] += attachment_bytes
+
+    return summary
 
 def export_to_excel(data, mailbox_email):
     wb = openpyxl.Workbook()
@@ -199,7 +214,8 @@ def export_to_excel(data, mailbox_email):
             "Attachment Size (MB)",
             "Has Attachments",
             "Received Date",
-            "Received Time"
+            "Received Time",
+            "Month"
         ])
 
         for msg in messages:
@@ -217,18 +233,22 @@ def export_to_excel(data, mailbox_email):
             has_attachments = "Yes" if attach_bytes > 0 else "No"
 
             received_dt = msg.get("receivedDateTime")
+            month_label = ""
             if received_dt:
                 try:
                     dt_str = received_dt.replace("Z", "")
                     dt_obj = datetime.datetime.fromisoformat(dt_str)
                     received_date = dt_obj.date().strftime("%Y-%m-%d")
                     received_time = dt_obj.time().strftime("%H:%M:%S")
+                    month_label = dt_obj.strftime("%Y-%m")
                 except ValueError:
                     received_date = received_dt
                     received_time = ""
+                    month_label = received_dt[:7]
             else:
                 received_date = ""
                 received_time = ""
+                month_label = "Nieznany"
 
             ws.append([
                 subject,
@@ -241,8 +261,36 @@ def export_to_excel(data, mailbox_email):
                 attach_mb,
                 has_attachments,
                 received_date,
-                received_time
+                received_time,
+                month_label
             ])
+
+    summary_sheet = wb.create_sheet(title="Podsumowanie")
+    summary_sheet.append([
+        "Mailbox",
+        "Folder",
+        "Month",
+        "Message Count",
+        "Total Size (bytes)",
+        "Total Size (MB)",
+        "Attachment Size (bytes)",
+        "Attachment Size (MB)"
+    ])
+
+    summary_data = build_monthly_summary(data)
+    for (folder_path, month_key), values in sorted(summary_data.items(), key=lambda x: (x[0][0], x[0][1])):
+        total_size_bytes = values["message_size"]
+        attachment_size_bytes = values["attachment_size"]
+        summary_sheet.append([
+            mailbox_email,
+            folder_path,
+            month_key,
+            values["message_count"],
+            total_size_bytes,
+            round(total_size_bytes / (1024 * 1024), 2),
+            attachment_size_bytes,
+            round(attachment_size_bytes / (1024 * 1024), 2)
+        ])
 
     safe_mailbox = mailbox_email.replace("@", "_at_").replace(".", "_")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
