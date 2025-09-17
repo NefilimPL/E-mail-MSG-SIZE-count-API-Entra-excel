@@ -186,7 +186,7 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
 
     return all_folders
 
-async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, url=None, retries=3):
+async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, retries=3):
     headers = {"Authorization": f"Bearer {token}"}
     base_url = (
         "https://graph.microsoft.com/v1.0/users/"
@@ -194,43 +194,43 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
     )
     attachments_expand = "attachments($select=size)"
     extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
-    extended_expand = (
-        f"{attachments_expand},singleValueExtendedProperties($filter={extended_filter})"
-    )
 
-    use_extended_size = False
-    if url is None:
-        url = (
-            f"{base_url}?$select=subject,receivedDateTime,hasAttachments,id,from,size"
-            f"&$expand={attachments_expand}"
-            "&$top=100"
-        )
-    fallback_url = (
-        f"{base_url}?$select=subject,receivedDateTime,hasAttachments,id,from"
-        f"&$expand={extended_expand}"
-        "&$top=100"
-    )
+    def build_url():
+        select_parts = [
+            "subject",
+            "receivedDateTime",
+            "hasAttachments",
+            "id",
+            "from",
+            "singleValueExtendedProperties",
+        ]
+        expand_parts = [
+            attachments_expand,
+            f"singleValueExtendedProperties($filter={extended_filter})",
+        ]
+        select_clause = ",".join(select_parts)
+        expand_clause = ",".join(expand_parts)
+        return f"{base_url}?$select={select_clause}&$expand={expand_clause}&$top=100"
 
+    url = build_url()
+    size_warning_logged = False
     messages = []
 
     while url:
         data, error = await fetch_with_error(session, url, headers, semaphore, retries, pbar)
         if not data:
-            error_body = (error or {}).get("body") or ""
+            error_body = ((error or {}).get("body") or "").lower()
             if (
-                not use_extended_size
-                and not messages
-                and (error or {}).get("status") == 400
-                and "property named 'size'" in error_body.lower()
+                (error or {}).get("status") == 400
+                and "property named 'size'" in error_body
+                and not size_warning_logged
             ):
-                use_extended_size = True
-                url = fallback_url
                 logging.warning(
-                    "Właściwość size nie jest dostępna dla skrzynki %s. "
-                    "Przełączanie na rozszerzoną właściwość PR_MESSAGE_SIZE.",
+                    "API Graph odrzuciło właściwość size dla skrzynki %s. "
+                    "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
                     mailbox_email,
                 )
-                continue
+                size_warning_logged = True
             break
 
         page_messages = data.get("value", [])
@@ -238,11 +238,14 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
             attachments = msg.get("attachments", []) or []
             attachment_size = sum(safe_int(att.get("size")) for att in attachments)
             msg["attachment_size"] = attachment_size
-            if use_extended_size:
-                message_size = extract_extended_message_size(msg)
-            else:
+
+            message_size = extract_extended_message_size(msg)
+            if message_size <= 0:
                 message_size = safe_int(msg.get("size"))
+            if message_size <= 0:
+                message_size = attachment_size
             msg["size"] = message_size
+
             msg.pop("attachments", None)
             msg.pop("singleValueExtendedProperties", None)
 
