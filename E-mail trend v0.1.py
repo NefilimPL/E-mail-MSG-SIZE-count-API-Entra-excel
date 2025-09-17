@@ -5,6 +5,7 @@ import asyncio
 import re
 import datetime
 from collections import defaultdict
+from urllib.parse import quote
 import msal
 import openpyxl
 from tqdm import tqdm
@@ -31,6 +32,19 @@ def check_modules():
 check_modules()
 
 import aiohttp
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def extract_extended_message_size(message):
+    for prop in message.get("singleValueExtendedProperties", []) or []:
+        prop_id = (prop.get("id") or "").lower()
+        if prop_id == "integer 0x0e08":
+            return safe_int(prop.get("value"))
+    return 0
 
 LOG_FILENAME = 'email_trend_app_only.log'
 logging.basicConfig(
@@ -82,6 +96,41 @@ async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
                 await asyncio.sleep(5)
             await asyncio.sleep(1)  # Dodaj opóźnienie między żądaniami
     return None
+
+async def fetch_with_error(session, url, headers, semaphore, retries=3, pbar=None):
+    async with semaphore:
+        attempts = retries
+        while attempts > 0:
+            try:
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        return await response.json(), None
+                    error_body = await response.text()
+                    if pbar:
+                        pbar.write(f"Błąd pobierania danych: {response.status} {error_body}")
+                    if response.status == 400:
+                        return None, {"status": response.status, "body": error_body}
+                    attempts -= 1
+                    if attempts > 0:
+                        if pbar:
+                            pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {attempts}")
+                        await asyncio.sleep(5)
+                        await asyncio.sleep(1)
+                        continue
+                    return None, {"status": response.status, "body": error_body}
+            except aiohttp.ClientError as e:
+                if pbar:
+                    pbar.write(f"Błąd połączenia: {e}")
+                attempts -= 1
+                if attempts > 0:
+                    if pbar:
+                        pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {attempts}")
+                    await asyncio.sleep(5)
+                    await asyncio.sleep(1)
+                    continue
+                return None, {"status": None, "body": str(e)}
+            await asyncio.sleep(1)
+    return None, {"status": None, "body": None}
 
 async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
     headers = {"Authorization": f"Bearer {token}"}
@@ -139,28 +188,64 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
 
 async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, url=None, retries=3):
     headers = {"Authorization": f"Bearer {token}"}
+    base_url = (
+        "https://graph.microsoft.com/v1.0/users/"
+        f"{mailbox_email}/mailFolders/{folder_id}/messages"
+    )
+    attachments_expand = "attachments($select=size)"
+    extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
+    extended_expand = (
+        f"{attachments_expand},singleValueExtendedProperties($filter={extended_filter})"
+    )
+
+    use_extended_size = False
     if url is None:
         url = (
-            "https://graph.microsoft.com/v1.0/users/"
-            f"{mailbox_email}/mailFolders/{folder_id}/messages"
-            "?$select=subject,receivedDateTime,hasAttachments,id,from,size"
-            "&$expand=attachments($select=size)"
+            f"{base_url}?$select=subject,receivedDateTime,hasAttachments,id,from,size"
+            f"&$expand={attachments_expand}"
             "&$top=100"
         )
+    fallback_url = (
+        f"{base_url}?$select=subject,receivedDateTime,hasAttachments,id,from"
+        f"&$expand={extended_expand}"
+        "&$top=100"
+    )
 
     messages = []
 
     while url:
-        data = await fetch(session, url, headers, semaphore, retries, pbar)
+        data, error = await fetch_with_error(session, url, headers, semaphore, retries, pbar)
         if not data:
+            error_body = (error or {}).get("body") or ""
+            if (
+                not use_extended_size
+                and not messages
+                and (error or {}).get("status") == 400
+                and "property named 'size'" in error_body.lower()
+            ):
+                use_extended_size = True
+                url = fallback_url
+                logging.warning(
+                    "Właściwość size nie jest dostępna dla skrzynki %s. "
+                    "Przełączanie na rozszerzoną właściwość PR_MESSAGE_SIZE.",
+                    mailbox_email,
+                )
+                continue
             break
+
         page_messages = data.get("value", [])
         for msg in page_messages:
             attachments = msg.get("attachments", []) or []
-            attachment_size = sum(att.get("size", 0) for att in attachments)
+            attachment_size = sum(safe_int(att.get("size")) for att in attachments)
             msg["attachment_size"] = attachment_size
-            if "attachments" in msg:
-                msg.pop("attachments", None)
+            if use_extended_size:
+                message_size = extract_extended_message_size(msg)
+            else:
+                message_size = safe_int(msg.get("size"))
+            msg["size"] = message_size
+            msg.pop("attachments", None)
+            msg.pop("singleValueExtendedProperties", None)
+
         messages.extend(page_messages)
         pbar.update(len(page_messages))
         url = data.get("@odata.nextLink")
@@ -175,8 +260,8 @@ def build_monthly_summary(mailbox_data):
     summary = defaultdict(lambda: {"message_count": 0, "message_size": 0, "attachment_size": 0})
     for folder_path, messages in mailbox_data.items():
         for msg in messages:
-            size_bytes = msg.get("size", 0) or 0
-            attachment_bytes = msg.get("attachment_size", 0) or 0
+            size_bytes = safe_int(msg.get("size", 0))
+            attachment_bytes = safe_int(msg.get("attachment_size", 0))
             received_dt = msg.get("receivedDateTime")
             month_key = "Nieznany"
             if received_dt:
@@ -222,11 +307,11 @@ def export_to_excel(data, mailbox_email):
             subject = msg.get("subject")
             sender = msg.get("from", {}).get("emailAddress", {}).get("address", "")
 
-            size_bytes = msg.get("size", 0)
+            size_bytes = safe_int(msg.get("size", 0))
             size_kb = round(size_bytes / 1024, 2)
             size_mb = round(size_bytes / (1024 * 1024), 2)
 
-            attach_bytes = msg.get("attachment_size", 0)
+            attach_bytes = safe_int(msg.get("attachment_size", 0))
             attach_kb = round(attach_bytes / 1024, 2)
             attach_mb = round(attach_bytes / (1024 * 1024), 2)
 
