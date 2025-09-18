@@ -242,7 +242,7 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
         "https://graph.microsoft.com/v1.0/users/"
         f"{mailbox_email}/mailFolders/{folder_id}/messages"
     )
-    attachments_expand = "attachments($select=size)"
+    attachments_expand = "attachments($select=size,isInline)"
     extended_filter = quote("id eq 'Integer 0x0E08' or id eq 'Long 0x0E08'", safe="")
 
     select_parts = [
@@ -278,18 +278,30 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
         page_messages = data.get("value", [])
         for msg in page_messages:
             attachments = msg.get("attachments", []) or []
-            attachment_size = sum(safe_int(att.get("size")) for att in attachments)
-            msg["attachment_size"] = attachment_size
+            regular_attachment_size = 0
+            inline_attachment_size = 0
+
+            for att in attachments:
+                att_size = safe_int(att.get("size"))
+                if not att_size:
+                    continue
+                if att.get("isInline"):
+                    inline_attachment_size += att_size
+                else:
+                    regular_attachment_size += att_size
+
+            msg["attachment_size"] = regular_attachment_size
 
             estimated_body = estimate_message_body_bytes(msg)
             extended_total = extract_extended_message_size(msg)
-            baseline_total = attachment_size + estimated_body
+            baseline_body = estimated_body + inline_attachment_size
+            baseline_total = regular_attachment_size + baseline_body
 
             if extended_total > 0:
                 total_size = max(extended_total, baseline_total)
-                body_size = max(total_size - attachment_size, estimated_body)
+                body_size = max(total_size - regular_attachment_size, baseline_body)
             else:
-                body_size = estimated_body
+                body_size = baseline_body
                 total_size = baseline_total
 
             msg["body_size"] = body_size
