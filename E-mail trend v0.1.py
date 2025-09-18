@@ -97,7 +97,16 @@ async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
             await asyncio.sleep(1)  # Dodaj opóźnienie między żądaniami
     return None
 
-async def fetch_with_error(session, url, headers, semaphore, retries=3, pbar=None):
+async def fetch_with_error(
+    session,
+    url,
+    headers,
+    semaphore,
+    retries=3,
+    pbar=None,
+    suppress_statuses=None,
+):
+    suppressed_statuses = set(suppress_statuses or [])
     async with semaphore:
         attempts = retries
         while attempts > 0:
@@ -106,7 +115,7 @@ async def fetch_with_error(session, url, headers, semaphore, retries=3, pbar=Non
                     if response.status == 200:
                         return await response.json(), None
                     error_body = await response.text()
-                    if pbar:
+                    if pbar and response.status not in suppressed_statuses:
                         pbar.write(f"Błąd pobierania danych: {response.status} {error_body}")
                     if response.status == 400:
                         return None, {"status": response.status, "body": error_body}
@@ -131,6 +140,32 @@ async def fetch_with_error(session, url, headers, semaphore, retries=3, pbar=Non
                 return None, {"status": None, "body": str(e)}
             await asyncio.sleep(1)
     return None, {"status": None, "body": None}
+
+
+async def mark_size_property_unsupported(mailbox_state, mailbox_email):
+    lock = mailbox_state.get("lock")
+    if lock:
+        async with lock:
+            already_logged = mailbox_state.get("warning_logged", False)
+            mailbox_state["size_supported"] = False
+            if not already_logged:
+                logging.warning(
+                    "API Graph odrzuciło właściwość size dla skrzynki %s. "
+                    "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
+                    mailbox_email,
+                )
+                mailbox_state["warning_logged"] = True
+            return
+
+    already_logged = mailbox_state.get("warning_logged", False)
+    mailbox_state["size_supported"] = False
+    if not already_logged:
+        logging.warning(
+            "API Graph odrzuciło właściwość size dla skrzynki %s. "
+            "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
+            mailbox_email,
+        )
+        mailbox_state["warning_logged"] = True
 
 async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
     headers = {"Authorization": f"Bearer {token}"}
@@ -186,7 +221,48 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
 
     return all_folders
 
-async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, retries=3):
+async def determine_mailbox_size_support(
+    session,
+    token,
+    mailbox_email,
+    folders,
+    semaphore,
+    mailbox_state,
+    pbar=None,
+):
+    if not folders:
+        mailbox_state["size_supported"] = True
+        return
+
+    headers = {"Authorization": f"Bearer {token}"}
+    for folder in folders:
+        folder_id = folder.get("id")
+        if not folder_id:
+            continue
+        test_url = (
+            "https://graph.microsoft.com/v1.0/users/"
+            f"{mailbox_email}/mailFolders/{folder_id}/messages?$select=id,size&$top=1"
+        )
+        data, error = await fetch_with_error(
+            session,
+            test_url,
+            headers,
+            semaphore,
+            retries=1,
+            pbar=pbar,
+            suppress_statuses={400},
+        )
+        if data:
+            mailbox_state["size_supported"] = True
+            return
+        if error:
+            error_body = (error.get("body") or "").lower()
+            if error.get("status") == 400 and "property named 'size'" in error_body:
+                await mark_size_property_unsupported(mailbox_state, mailbox_email)
+                return
+    mailbox_state["size_supported"] = True
+
+async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, mailbox_state, retries=3):
     headers = {"Authorization": f"Bearer {token}"}
     base_url = (
         "https://graph.microsoft.com/v1.0/users/"
@@ -195,10 +271,12 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
     attachments_expand = "attachments($select=size)"
     extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
 
-    include_size = True
-    size_warning_logged = False
+    include_size = mailbox_state.get("size_supported", True)
 
     while True:
+        if include_size and not mailbox_state.get("size_supported", True):
+            include_size = False
+
         def build_url():
             select_parts = [
                 "subject",
@@ -232,13 +310,7 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
                     and (error or {}).get("status") == 400
                     and "property named 'size'" in error_body
                 ):
-                    if not size_warning_logged:
-                        logging.warning(
-                            "API Graph odrzuciło właściwość size dla skrzynki %s. "
-                            "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
-                            mailbox_email,
-                        )
-                        size_warning_logged = True
+                    await mark_size_property_unsupported(mailbox_state, mailbox_email)
                     include_size = False
                     restart_fetch = True
                     break
@@ -447,7 +519,34 @@ async def process_mailbox(session, mailbox, token, semaphore):
 
             mailbox_data = {}
 
-            tasks = [get_messages_from_folder(session, token, mailbox, f["id"], pbar, semaphore) for f in folders]
+            mailbox_state = {
+                "size_supported": True,
+                "warning_logged": False,
+                "lock": asyncio.Lock(),
+            }
+
+            await determine_mailbox_size_support(
+                session,
+                token,
+                mailbox,
+                folders,
+                semaphore,
+                mailbox_state,
+                pbar,
+            )
+
+            tasks = [
+                get_messages_from_folder(
+                    session,
+                    token,
+                    mailbox,
+                    f["id"],
+                    pbar,
+                    semaphore,
+                    mailbox_state,
+                )
+                for f in folders
+            ]
             results = await asyncio.gather(*tasks)
             for f, messages in zip(folders, results):
                 mailbox_data[f["path"]] = messages
