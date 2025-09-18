@@ -195,70 +195,90 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
     attachments_expand = "attachments($select=size)"
     extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
 
-    def build_url():
-        select_parts = [
-            "subject",
-            "receivedDateTime",
-            "hasAttachments",
-            "id",
-            "from",
-            "singleValueExtendedProperties",
-        ]
-        expand_parts = [
-            attachments_expand,
-            f"singleValueExtendedProperties($filter={extended_filter})",
-        ]
-        select_clause = ",".join(select_parts)
-        expand_clause = ",".join(expand_parts)
-        return f"{base_url}?$select={select_clause}&$expand={expand_clause}&$top=100"
-
-    url = build_url()
+    include_size = True
     size_warning_logged = False
-    messages = []
 
-    while url:
-        data, error = await fetch_with_error(session, url, headers, semaphore, retries, pbar)
-        if not data:
-            error_body = ((error or {}).get("body") or "").lower()
-            if (
-                (error or {}).get("status") == 400
-                and "property named 'size'" in error_body
-                and not size_warning_logged
-            ):
-                logging.warning(
-                    "API Graph odrzuciło właściwość size dla skrzynki %s. "
-                    "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
-                    mailbox_email,
-                )
-                size_warning_logged = True
-            break
+    while True:
+        def build_url():
+            select_parts = [
+                "subject",
+                "receivedDateTime",
+                "hasAttachments",
+                "id",
+                "from",
+                "singleValueExtendedProperties",
+            ]
+            if include_size:
+                select_parts.append("size")
+            expand_parts = [
+                attachments_expand,
+                f"singleValueExtendedProperties($filter={extended_filter})",
+            ]
+            select_clause = ",".join(select_parts)
+            expand_clause = ",".join(expand_parts)
+            return f"{base_url}?$select={select_clause}&$expand={expand_clause}&$top=100"
 
-        page_messages = data.get("value", [])
-        for msg in page_messages:
-            attachments = msg.get("attachments", []) or []
-            attachment_size = sum(safe_int(att.get("size")) for att in attachments)
-            msg["attachment_size"] = attachment_size
+        url = build_url()
+        messages = []
+        restart_fetch = False
 
-            total_size = extract_extended_message_size(msg)
-            if total_size <= 0:
-                total_size = safe_int(msg.get("size"))
-            if total_size <= 0:
-                total_size = attachment_size
+        while url:
+            data, error = await fetch_with_error(session, url, headers, semaphore, retries, pbar)
+            if not data:
+                error_body = ((error or {}).get("body") or "").lower()
+                if (
+                    include_size
+                    and not messages
+                    and (error or {}).get("status") == 400
+                    and "property named 'size'" in error_body
+                ):
+                    if not size_warning_logged:
+                        logging.warning(
+                            "API Graph odrzuciło właściwość size dla skrzynki %s. "
+                            "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
+                            mailbox_email,
+                        )
+                        size_warning_logged = True
+                    include_size = False
+                    restart_fetch = True
+                    break
+                break
 
-            body_size = max(total_size - attachment_size, 0)
+            page_messages = data.get("value", [])
+            for msg in page_messages:
+                attachments = msg.get("attachments", []) or []
+                attachment_size = sum(safe_int(att.get("size")) for att in attachments)
+                msg["attachment_size"] = attachment_size
 
-            msg["total_size"] = total_size
-            msg["body_size"] = body_size
-            msg["size"] = body_size
+                total_size_candidates = [
+                    extract_extended_message_size(msg),
+                    safe_int(msg.get("size")),
+                ]
+                total_size_candidates = [value for value in total_size_candidates if value > 0]
+                if total_size_candidates:
+                    total_size = max(total_size_candidates)
+                else:
+                    total_size = attachment_size
+                total_size = max(total_size, attachment_size)
 
-            msg.pop("attachments", None)
-            msg.pop("singleValueExtendedProperties", None)
+                body_size = total_size - attachment_size
+                if body_size < 0:
+                    body_size = 0
 
-        messages.extend(page_messages)
-        pbar.update(len(page_messages))
-        url = data.get("@odata.nextLink")
+                msg["total_size"] = total_size
+                msg["body_size"] = body_size
 
-    return messages
+                msg.pop("attachments", None)
+                msg.pop("singleValueExtendedProperties", None)
+
+            messages.extend(page_messages)
+            pbar.update(len(page_messages))
+            url = data.get("@odata.nextLink")
+
+        if restart_fetch:
+            continue
+
+        return messages
 
 def sanitize_sheet_name(name: str) -> str:
     cleaned = re.sub(r'[\\/:\?\*\[\]]+', '_', name)
