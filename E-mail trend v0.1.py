@@ -3,6 +3,7 @@ import sys
 import subprocess
 import asyncio
 import re
+import math
 import datetime
 from collections import defaultdict
 from urllib.parse import quote
@@ -34,16 +35,51 @@ check_modules()
 import aiohttp
 
 def safe_int(value, default=0):
-    try:
+    if isinstance(value, bool):
         return int(value)
-    except (TypeError, ValueError):
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return int(value)
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return default
+
+        cleaned = (
+            cleaned.replace(" ", "")
+            .replace("\u00a0", "")
+            .replace(",", ".")
+        )
+
+        try:
+            return int(cleaned)
+        except ValueError:
+            try:
+                return int(float(cleaned))
+            except ValueError:
+                match = re.search(r"-?\d+", cleaned)
+                if match:
+                    try:
+                        return int(match.group(0))
+                    except ValueError:
+                        return default
         return default
+
+    return default
 
 def extract_extended_message_size(message):
     for prop in message.get("singleValueExtendedProperties", []) or []:
         prop_id = (prop.get("id") or "").lower()
-        if prop_id == "integer 0x0e08":
-            return safe_int(prop.get("value"))
+        if prop_id in {"integer 0x0e08", "long 0x0e08"}:
+            size_value = safe_int(prop.get("value"))
+            if size_value:
+                return size_value
     return 0
 
 
@@ -207,7 +243,7 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
         f"{mailbox_email}/mailFolders/{folder_id}/messages"
     )
     attachments_expand = "attachments($select=size)"
-    extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
+    extended_filter = quote("id eq 'Integer 0x0E08' or id eq 'Long 0x0E08'", safe="")
 
     select_parts = [
         "subject",
