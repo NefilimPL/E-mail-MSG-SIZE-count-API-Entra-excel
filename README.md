@@ -14,7 +14,7 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
 1. Uruchomić skrypt (`python "E-mail trend v0.1.py"`).
 2. Po pierwszym uruchomieniu pojawi się plik `email_trend_config.json`.
 3. Uzupełnić pola `client_id`, `tenant_id` oraz `client_secret` danymi z aplikacji w Entra ID.
-4. Opcjonalnie dopasować pozostałe ustawienia (zakresy uprawnień, poziom logowania, limity czasowe, liczbę równoległych zapytań).
+4. Opcjonalnie dopasować pozostałe ustawienia (zakresy uprawnień, poziom logowania, limity czasowe, liczbę równoległych zapytań i rozmiar paczek folderów).
 5. Zapisać zmiany i ponownie uruchomić skrypt.
 
 ### Przykładowa struktura pliku `email_trend_config.json`
@@ -32,9 +32,16 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
   "fetch_timeout_seconds": 30,
   "retry_delay_seconds": 5,
   "throttle_delay_seconds": 1,
-  "semaphore_limit": 7
+  "semaphore_limit": 7,
+  "max_folder_batch_size": 3
 }
 ```
+
+### Ograniczanie throttlingu
+
+* `semaphore_limit` określa maksymalną liczbę równoległych żądań HTTP, jakie mogą być wykonywane jednocześnie.
+* `max_folder_batch_size` ogranicza liczbę folderów pobieranych w jednej paczce, co zmniejsza krótkotrwałe skoki obciążenia.
+* Skrypt respektuje odpowiedzi 429 (`Retry-After`), wprowadza wykładniczy backoff i współdzieloną kolejkę żądań, dzięki czemu kolejne zapytania są automatycznie spowalniane po sygnale o limitach.
 
 ### Logowanie
 

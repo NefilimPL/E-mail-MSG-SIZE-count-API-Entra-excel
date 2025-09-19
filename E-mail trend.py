@@ -9,6 +9,8 @@ import datetime
 from collections import defaultdict
 from urllib.parse import quote
 import logging
+import email.utils
+from contextlib import asynccontextmanager
 
 required_modules = ["requests", "msal", "openpyxl", "tqdm", "aiohttp"]
 
@@ -55,6 +57,7 @@ DEFAULT_CONFIG = {
     "retry_delay_seconds": 5,
     "throttle_delay_seconds": 1,
     "semaphore_limit": 7,
+    "max_folder_batch_size": 3,
 }
 
 REQUIRED_CONFIG_KEYS = ["client_id", "tenant_id", "client_secret"]
@@ -298,14 +301,72 @@ SEMAPHORE_LIMIT = _get_int_setting("semaphore_limit")
 if SEMAPHORE_LIMIT <= 0:
     SEMAPHORE_LIMIT = DEFAULT_CONFIG["semaphore_limit"]
 
+FOLDER_BATCH_SIZE = _get_int_setting("max_folder_batch_size")
+if FOLDER_BATCH_SIZE <= 0:
+    FOLDER_BATCH_SIZE = 1
+
+BASE_BACKOFF_SECONDS = max(RETRY_DELAY_SECONDS, THROTTLE_DELAY_SECONDS, 1.0)
+MAX_BACKOFF_SECONDS = max(BASE_BACKOFF_SECONDS * 8, BASE_BACKOFF_SECONDS, 60.0)
+
 logging.info("Używany plik konfiguracyjny: %s", CONFIG_PATH)
 logging.info(
-    "Ustawienia żądań: timeout=%ss, retry_delay=%ss, throttle_delay=%ss, limit=%s",
+    "Ustawienia żądań: timeout=%ss, retry_delay=%ss, throttle_delay=%ss, limit=%s, batch_size=%s",
     fetch_timeout_seconds,
     RETRY_DELAY_SECONDS,
     THROTTLE_DELAY_SECONDS,
     SEMAPHORE_LIMIT,
+    FOLDER_BATCH_SIZE,
 )
+
+class RequestThrottler:
+    def __init__(self, concurrency_limit, base_interval_seconds):
+        limit = max(1, int(concurrency_limit))
+        self._semaphore = asyncio.Semaphore(limit)
+        self._base_interval = max(float(base_interval_seconds), 0.0)
+        self._lock = asyncio.Lock()
+        self._next_available_time = 0.0
+        self._cooldown_until = 0.0
+
+    async def _reserve_window(self):
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            now = loop.time()
+            wait_until = max(self._next_available_time, self._cooldown_until)
+            wait_time = max(0.0, wait_until - now)
+            scheduled_from = max(now, wait_until)
+            self._next_available_time = scheduled_from + self._base_interval
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+    @asynccontextmanager
+    async def slot(self):
+        await self._semaphore.acquire()
+        try:
+            await self._reserve_window()
+            token = _ThrottleToken(self)
+            yield token
+        finally:
+            self._semaphore.release()
+
+    async def apply_cooldown(self, wait_seconds):
+        try:
+            wait_value = float(wait_seconds)
+        except (TypeError, ValueError):
+            return
+        if wait_value <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            now = loop.time()
+            self._cooldown_until = max(self._cooldown_until, now + wait_value)
+
+
+class _ThrottleToken:
+    def __init__(self, throttler: RequestThrottler):
+        self._throttler = throttler
+
+    async def extend_cooldown(self, wait_seconds):
+        await self._throttler.apply_cooldown(wait_seconds)
 
 
 def safe_int(value, default=0):
@@ -412,6 +473,42 @@ def estimate_message_body_bytes(message):
 
     return total_bytes
 
+
+def parse_retry_after(header_value):
+    if not header_value:
+        return None
+    value = str(header_value).strip()
+    if not value:
+        return None
+
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = None
+
+    if seconds is not None:
+        if seconds < 0:
+            return None
+        return seconds
+
+    try:
+        retry_dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+    if retry_dt is None:
+        return None
+
+    if retry_dt.tzinfo is None:
+        retry_dt = retry_dt.replace(tzinfo=datetime.timezone.utc)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    delay = (retry_dt - now).total_seconds()
+    if delay < 0:
+        return None
+    return delay
+
+
 def get_access_token():
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     app = msal.ConfidentialClientApplication(
@@ -438,62 +535,88 @@ def get_access_token():
         raise Exception(f"Nie udało się uzyskać tokena: {error_details}")
     return token_response["access_token"]
 
-async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
+async def fetch(session, url, headers, throttler, retries=3, pbar=None):
     attempts_left = retries
     last_error_summary = ""
-    async with semaphore:
-        while attempts_left > 0:
+    backoff_seconds = BASE_BACKOFF_SECONDS
+
+    while attempts_left > 0:
+        current_wait = backoff_seconds
+        async with throttler.slot() as throttle_slot:
             try:
                 async with session.get(
                     url,
                     headers=headers,
                     timeout=FETCH_TIMEOUT,
                 ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        error_summary = summarize_text(error_text)
-                        logging.warning(
-                            "Błąd pobierania danych (%s) dla %s: %s",
-                            response.status,
-                            url,
-                            error_summary or "brak treści",
-                        )
-                        if pbar:
-                            pbar.write(
-                                f"Błąd pobierania danych: {response.status} {error_text}"
-                            )
-                        last_error_summary = (
-                            f"{response.status} {error_summary}".strip()
-                            or last_error_summary
-                        )
-                    else:
+                    if response.status == 200:
                         return await response.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                error_summary = summarize_text(e)
+
+                    error_text = await response.text()
+                    error_summary = summarize_text(error_text)
+                    logging.warning(
+                        "Błąd pobierania danych (%s) dla %s: %s",
+                        response.status,
+                        url,
+                        error_summary or "brak treści",
+                    )
+                    if pbar:
+                        pbar.write(
+                            f"Błąd pobierania danych: {response.status} {error_text}"
+                        )
+                    last_error_summary = (
+                        f"{response.status} {error_summary}".strip()
+                        or last_error_summary
+                    )
+
+                    if response.status == 429:
+                        retry_after_header = response.headers.get("Retry-After")
+                        retry_after_seconds = parse_retry_after(retry_after_header)
+                        if retry_after_seconds is None:
+                            retry_after_seconds = backoff_seconds * 2
+                        retry_after_seconds = max(
+                            THROTTLE_DELAY_SECONDS, min(retry_after_seconds, MAX_BACKOFF_SECONDS)
+                        )
+                        current_wait = max(current_wait, retry_after_seconds)
+                        await throttle_slot.extend_cooldown(retry_after_seconds)
+                    elif response.status >= 500:
+                        server_wait = min(backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+                        current_wait = max(current_wait, server_wait)
+                        await throttle_slot.extend_cooldown(server_wait)
+                    else:
+                        await throttle_slot.extend_cooldown(THROTTLE_DELAY_SECONDS)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                error_summary = summarize_text(error)
                 logging.warning(
                     "Wyjątek podczas pobierania %s: %s",
                     url,
-                    error_summary or f"{e.__class__.__name__}: {e}",
+                    error_summary or f"{error.__class__.__name__}: {error}",
                 )
                 if pbar:
                     pbar.write(
-                        f"Błąd połączenia: {e.__class__.__name__}: {e}"
+                        f"Błąd połączenia: {error.__class__.__name__}: {error}"
                     )
-                last_error_summary = error_summary or f"{e.__class__.__name__}: {e}"
+                last_error_summary = error_summary or f"{error.__class__.__name__}: {error}"
+                connection_wait = min(backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+                current_wait = max(current_wait, connection_wait)
+                await throttle_slot.extend_cooldown(connection_wait)
 
-            attempts_left -= 1
-            if attempts_left > 0:
-                if pbar:
-                    pbar.write(
-                        f"Ponawianie próby pobierania danych... Pozostało prób: {attempts_left}"
-                    )
-                logging.debug(
-                    "Ponawianie pobierania %s. Pozostało prób: %s",
-                    url,
-                    attempts_left,
+        attempts_left -= 1
+        if attempts_left > 0:
+            if pbar:
+                pbar.write(
+                    f"Ponawianie próby pobierania danych... Pozostało prób: {attempts_left}"
                 )
-                await asyncio.sleep(RETRY_DELAY_SECONDS)
-                await asyncio.sleep(THROTTLE_DELAY_SECONDS)
+            logging.debug(
+                "Ponawianie pobierania %s. Pozostało prób: %s",
+                url,
+                attempts_left,
+            )
+            await asyncio.sleep(current_wait)
+            backoff_seconds = min(
+                max(backoff_seconds * 2, current_wait),
+                MAX_BACKOFF_SECONDS,
+            )
 
     if pbar:
         pbar.write("Nie udało się pobrać danych po wielu próbach.")
@@ -505,7 +628,7 @@ async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
     )
     return None
 
-async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
+async def get_child_folders(session, token, mailbox_email, folder, throttler, path="", pbar=None):
     headers = {"Authorization": f"Bearer {token}"}
 
     folder_id = folder.get("id")
@@ -529,7 +652,7 @@ async def get_child_folders(session, token, mailbox_email, folder, semaphore, pa
     child_url = f"https://graph.microsoft.com/v1.0/users/{mailbox_email}/mailFolders/{folder_id}/childFolders?$top=100"
 
     while child_url:
-        data = await fetch(session, child_url, headers, semaphore, pbar=pbar)
+        data = await fetch(session, child_url, headers, throttler, pbar=pbar)
         if not data:
             logging.warning(
                 "Brak danych podfolderów dla %s w ścieżce %s.",
@@ -540,19 +663,19 @@ async def get_child_folders(session, token, mailbox_email, folder, semaphore, pa
         children = data.get("value", [])
 
         for child in children:
-            result.extend(await get_child_folders(session, token, mailbox_email, child, semaphore, current_path, pbar))
+            result.extend(await get_child_folders(session, token, mailbox_email, child, throttler, current_path, pbar))
 
         child_url = data.get("@odata.nextLink")
 
     return result
 
-async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
+async def get_all_folders(session, token, mailbox_email, throttler, pbar=None):
     headers = {"Authorization": f"Bearer {token}"}
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox_email}/mailFolders?$top=100"
     all_folders = []
 
     while url:
-        data = await fetch(session, url, headers, semaphore, pbar=pbar)
+        data = await fetch(session, url, headers, throttler, pbar=pbar)
         if not data:
             logging.error(
                 "Nie udało się pobrać listy folderów dla %s (adres żądania: %s).",
@@ -563,13 +686,13 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
         top_folders = data.get("value", [])
 
         for f in top_folders:
-            all_folders.extend(await get_child_folders(session, token, mailbox_email, f, semaphore, path="", pbar=pbar))
+            all_folders.extend(await get_child_folders(session, token, mailbox_email, f, throttler, path="", pbar=pbar))
 
         url = data.get("@odata.nextLink")
 
     return all_folders
 
-async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, retries=3):
+async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, throttler, retries=3):
     headers = {
         "Authorization": f"Bearer {token}",
         "Prefer": 'outlook.body-content-type="html"',
@@ -607,7 +730,7 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
     messages = []
 
     while url:
-        data = await fetch(session, url, headers, semaphore, retries, pbar)
+        data = await fetch(session, url, headers, throttler, retries, pbar)
         if not data:
             logging.error(
                 "Brak danych wiadomości dla folderu %s w skrzynce %s.",
@@ -842,60 +965,63 @@ def export_to_excel(data, mailbox_email):
     wb.save(filename)
     logging.info(f"Dane zapisano do pliku: {filename}")
 
-async def process_mailbox(session, mailbox, token, semaphore):
+async def process_mailbox(session, mailbox, token, throttler):
     try:
         logging.info(f"Przetwarzanie skrzynki: {mailbox}")
         with tqdm(total=1, desc=f"Przetwarzanie {mailbox}", unit="msg", position=0, leave=True) as pbar:
-            folders = await get_all_folders(session, token, mailbox, semaphore, pbar)
+            folders = await get_all_folders(session, token, mailbox, throttler, pbar)
             total_msgs = sum(f.get("totalItemCount", 0) for f in folders)
             pbar.total = total_msgs
 
             mailbox_data = {}
 
-            tasks = [
-                get_messages_from_folder(
-                    session,
-                    token,
-                    mailbox,
-                    f["id"],
-                    pbar,
-                    semaphore,
-                )
-                for f in folders
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for folder_meta, result in zip(folders, results):
-                folder_path = folder_meta["path"]
-                if isinstance(result, Exception):
-                    error_summary = summarize_text(result)
-                    logging.warning(
-                        "Błąd pobierania folderu %s (%s): %s. Ponawiam próbę...",
-                        folder_path,
-                        folder_meta.get("id"),
-                        error_summary or result.__class__.__name__,
+            for index in range(0, len(folders), FOLDER_BATCH_SIZE):
+                current_batch = folders[index : index + FOLDER_BATCH_SIZE]
+                tasks = [
+                    get_messages_from_folder(
+                        session,
+                        token,
+                        mailbox,
+                        folder_meta["id"],
+                        pbar,
+                        throttler,
                     )
-                    try:
-                        retry_messages = await get_messages_from_folder(
-                            session,
-                            token,
-                            mailbox,
-                            folder_meta["id"],
-                            pbar,
-                            semaphore,
-                        )
-                    except Exception as retry_error:
-                        retry_summary = summarize_text(retry_error)
-                        logging.error(
-                            "Nie udało się pobrać folderu %s po ponownej próbie: %s",
-                            folder_path,
-                            retry_summary or retry_error.__class__.__name__,
-                        )
-                        mailbox_data[folder_path] = []
-                    else:
-                        mailbox_data[folder_path] = retry_messages or []
-                    continue
+                    for folder_meta in current_batch
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                mailbox_data[folder_path] = result or []
+                for folder_meta, result in zip(current_batch, results):
+                    folder_path = folder_meta["path"]
+                    if isinstance(result, Exception):
+                        error_summary = summarize_text(result)
+                        logging.warning(
+                            "Błąd pobierania folderu %s (%s): %s. Ponawiam próbę...",
+                            folder_path,
+                            folder_meta.get("id"),
+                            error_summary or result.__class__.__name__,
+                        )
+                        try:
+                            retry_messages = await get_messages_from_folder(
+                                session,
+                                token,
+                                mailbox,
+                                folder_meta["id"],
+                                pbar,
+                                throttler,
+                            )
+                        except Exception as retry_error:
+                            retry_summary = summarize_text(retry_error)
+                            logging.error(
+                                "Nie udało się pobrać folderu %s po ponownej próbie: %s",
+                                folder_path,
+                                retry_summary or retry_error.__class__.__name__,
+                            )
+                            mailbox_data[folder_path] = []
+                        else:
+                            mailbox_data[folder_path] = retry_messages or []
+                        continue
+
+                    mailbox_data[folder_path] = result or []
 
             export_to_excel(mailbox_data, mailbox)
     except Exception:
@@ -909,10 +1035,13 @@ async def main():
     mailboxes_input = input("Podaj adresy skrzynek oddzielone przecinkiem: ").strip()
     mailbox_list = [m.strip() for m in mailboxes_input.split(",") if m.strip()]
 
-    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+    throttler = RequestThrottler(SEMAPHORE_LIMIT, THROTTLE_DELAY_SECONDS)
 
     async with aiohttp.ClientSession() as session:
-        tasks = [process_mailbox(session, mailbox, token, semaphore) for mailbox in mailbox_list]
+        tasks = [
+            process_mailbox(session, mailbox, token, throttler)
+            for mailbox in mailbox_list
+        ]
         await asyncio.gather(*tasks)
 
     logging.info("Przetwarzanie zakończone.")
