@@ -37,11 +37,17 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
 }
 ```
 
-### Ograniczanie throttlingu
+## Jak działa skrypt
 
-* `semaphore_limit` określa maksymalną liczbę równoległych żądań HTTP, jakie mogą być wykonywane jednocześnie.
-* `max_folder_batch_size` ogranicza liczbę folderów pobieranych w jednej paczce, co zmniejsza krótkotrwałe skoki obciążenia.
-* Skrypt respektuje odpowiedzi 429 (`Retry-After`), wprowadza wykładniczy backoff i współdzieloną kolejkę żądań, dzięki czemu kolejne zapytania są automatycznie spowalniane po sygnale o limitach.
+1. **Kontrola środowiska** – przy pierwszym uruchomieniu skrypt sprawdza, czy wymagane moduły (`requests`, `msal`, `openpyxl`, `tqdm`, `aiohttp`) są dostępne. Brakujące biblioteki są instalowane automatycznie, a skrypt wznawia działanie po zakończeniu instalacji.
+2. **Ładowanie konfiguracji** – plik `email_trend_config.json` jest wczytywany i walidowany. Brakujące klucze są dopisywane z wartościami domyślnymi, a nieprawidłowe wartości (np. ujemne limity czasowe) są zastępowane bezpiecznymi ustawieniami.
+3. **Uwierzytelnianie** – na podstawie `client_id`, `tenant_id`, `client_secret` i listy `scopes` tworzony jest klient MSAL, który pobiera token dostępu aplikacji (tryb app-only) do Microsoft Graph.
+4. **Pobieranie skrzynek** – po podaniu adresów e-mail skrypt równolegle przetwarza każdą skrzynkę. Dla każdej skrzynki rekurencyjnie pobiera strukturę folderów, korzystając z ograniczeń `semaphore_limit` oraz opóźnień `throttle_delay_seconds`, aby nie przeciążać API.
+5. **Pobieranie wiadomości** – z każdego folderu pobierane są wiadomości wraz z nagłówkami, rozmiarem ciała i załączników. Skrypt potrafi oszacować rozmiar wiadomości nawet wtedy, gdy Graph nie zwraca wszystkich danych, np. na podstawie nagłówków i podglądu treści.
+6. **Obsługa błędów** – operacje sieciowe mają wbudowane ponawianie (`retry_delay_seconds`) i limit czasu (`fetch_timeout_seconds`). Każda nieudana próba jest logowana, a skrócone komunikaty błędów pozwalają szybko znaleźć przyczynę problemu.
+7. **Eksport do Excela** – po zebraniu wszystkich wiadomości dane zapisywane są do pliku `.xlsx`. Powstaje osobna karta dla każdego folderu (z listą wiadomości i rozmiarami) oraz karta `Podsumowanie`, która agreguje liczbę wiadomości i łączny rozmiar miesięcznie dla każdego folderu.
+8. **Informacje pomocnicze** – pasek postępu (`tqdm`) pokazuje liczbę przetworzonych wiadomości, a logi zapisywane są zarówno do pliku jak i na standardowe wyjście, co ułatwia nadzór nad działaniem narzędzia.
+
 
 ### Logowanie
 
