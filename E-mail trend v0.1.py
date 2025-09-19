@@ -4,6 +4,7 @@ import subprocess
 import asyncio
 import re
 import math
+import json
 import datetime
 from collections import defaultdict
 from urllib.parse import quote
@@ -35,9 +36,273 @@ check_modules()
 import aiohttp
 
 
-FETCH_TIMEOUT = aiohttp.ClientTimeout(total=30)
-RETRY_DELAY_SECONDS = 5
-THROTTLE_DELAY_SECONDS = 1
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILENAME = "email_trend_config.json"
+CONFIG_PATH = os.path.join(SCRIPT_DIR, CONFIG_FILENAME)
+
+DEFAULT_CONFIG = {
+    "client_id": "",
+    "tenant_id": "",
+    "client_secret": "",
+    "scopes": ["https://graph.microsoft.com/.default"],
+    "log_filename": "email_trend_app_only.log",
+    "log_level": "INFO",
+    "fetch_timeout_seconds": 30,
+    "retry_delay_seconds": 5,
+    "throttle_delay_seconds": 1,
+    "semaphore_limit": 7,
+}
+
+REQUIRED_CONFIG_KEYS = ["client_id", "tenant_id", "client_secret"]
+
+
+def _write_config(config_data):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
+            json.dump(config_data, config_file, indent=4, ensure_ascii=False)
+    except OSError as error:
+        print(f"Nie można zapisać pliku konfiguracyjnego {CONFIG_FILENAME}: {error}")
+        sys.exit(1)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
+                json.dump(DEFAULT_CONFIG, config_file, indent=4, ensure_ascii=False)
+        except OSError as error:
+            print(
+                f"Nie można utworzyć pliku konfiguracyjnego {CONFIG_FILENAME}: {error}"
+            )
+            sys.exit(1)
+
+        print(
+            f"Utworzono plik konfiguracyjny {CONFIG_FILENAME} w lokalizacji {CONFIG_PATH}."
+        )
+        print("Uzupełnij wymagane dane i uruchom ponownie skrypt.")
+        sys.exit(0)
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            config_data = json.load(config_file)
+    except json.JSONDecodeError as error:
+        print(
+            f"Błąd analizy pliku konfiguracyjnego {CONFIG_FILENAME}: {error}."
+            " Usuń plik lub popraw jego zawartość."
+        )
+        sys.exit(1)
+    except OSError as error:
+        print(f"Nie można odczytać pliku konfiguracyjnego {CONFIG_FILENAME}: {error}")
+        sys.exit(1)
+
+    if not isinstance(config_data, dict):
+        print(
+            f"Plik {CONFIG_FILENAME} ma nieprawidłowy format. Oczekiwano obiektu JSON."
+        )
+        sys.exit(1)
+
+    updated = False
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in config_data:
+            config_data[key] = default_value
+            updated = True
+
+    if updated:
+        try:
+            _write_config(config_data)
+        except SystemExit:
+            raise
+        else:
+            print(
+                "Plik konfiguracyjny został uzupełniony brakującymi ustawieniami."
+            )
+
+    missing = [
+        key for key in REQUIRED_CONFIG_KEYS if not str(config_data.get(key, "")).strip()
+    ]
+    if missing:
+        missing_values = ", ".join(missing)
+        print(
+            f"W pliku konfiguracyjnym {CONFIG_FILENAME} brakuje wartości dla: {missing_values}."
+        )
+        print("Uzupełnij dane i uruchom ponownie skrypt.")
+        sys.exit(1)
+
+    return config_data
+
+
+CONFIG = load_config()
+
+
+def _read_positive_float(value, default):
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+    if math.isnan(number) or math.isinf(number) or number <= 0:
+        return default
+    return number
+
+
+def _read_positive_int(value, default):
+    number = _read_positive_float(value, default)
+    try:
+        int_value = int(number)
+    except (TypeError, ValueError):
+        return default
+    if int_value <= 0:
+        return default
+    return int_value
+
+
+def _parse_scopes(value):
+    if isinstance(value, list):
+        scopes = [str(item).strip() for item in value if str(item).strip()]
+    elif isinstance(value, str):
+        scopes = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        scopes = []
+
+    if not scopes:
+        scopes = DEFAULT_CONFIG["scopes"]
+    return scopes
+
+
+def _get_float_setting(key):
+    raw_value = CONFIG.get(key, DEFAULT_CONFIG[key])
+    parsed_value = _read_positive_float(raw_value, DEFAULT_CONFIG[key])
+    raw_str = str(raw_value).strip() if raw_value is not None else ""
+
+    if raw_str and parsed_value == DEFAULT_CONFIG[key]:
+        try:
+            raw_number = float(raw_str)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Nieprawidłowa wartość %s w pliku konfiguracyjnym: %r. Używam domyślnej: %s.",
+                key,
+                raw_value,
+                DEFAULT_CONFIG[key],
+            )
+        else:
+            if math.isnan(raw_number) or math.isinf(raw_number) or raw_number <= 0:
+                logging.warning(
+                    "Nieprawidłowa wartość %s w pliku konfiguracyjnym: %r. Używam domyślnej: %s.",
+                    key,
+                    raw_value,
+                    DEFAULT_CONFIG[key],
+                )
+
+    return parsed_value
+
+
+def _get_int_setting(key):
+    raw_value = CONFIG.get(key, DEFAULT_CONFIG[key])
+    parsed_value = _read_positive_int(raw_value, DEFAULT_CONFIG[key])
+    raw_str = str(raw_value).strip() if raw_value is not None else ""
+
+    if raw_str and parsed_value == DEFAULT_CONFIG[key]:
+        try:
+            raw_number = float(raw_str)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Nieprawidłowa wartość %s w pliku konfiguracyjnym: %r. Używam domyślnej: %s.",
+                key,
+                raw_value,
+                DEFAULT_CONFIG[key],
+            )
+        else:
+            if math.isnan(raw_number) or math.isinf(raw_number) or raw_number <= 0:
+                logging.warning(
+                    "Nieprawidłowa wartość %s w pliku konfiguracyjnym: %r. Używam domyślnej: %s.",
+                    key,
+                    raw_value,
+                    DEFAULT_CONFIG[key],
+                )
+
+    return parsed_value
+
+
+raw_log_filename = str(
+    CONFIG.get("log_filename", DEFAULT_CONFIG["log_filename"])
+).strip()
+LOG_FILENAME = raw_log_filename or DEFAULT_CONFIG["log_filename"]
+LOG_FILE_PATH = (
+    LOG_FILENAME
+    if os.path.isabs(LOG_FILENAME)
+    else os.path.join(SCRIPT_DIR, LOG_FILENAME)
+)
+
+log_directory = os.path.dirname(LOG_FILE_PATH)
+if log_directory:
+    os.makedirs(log_directory, exist_ok=True)
+
+raw_log_level = str(
+    CONFIG.get("log_level", DEFAULT_CONFIG["log_level"])
+).strip().upper()
+LOG_LEVEL = getattr(logging, raw_log_level, logging.INFO)
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE_PATH, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+if raw_log_level and raw_log_level != logging.getLevelName(LOG_LEVEL):
+    logging.warning(
+        "Nieprawidłowa wartość log_level w pliku konfiguracyjnym: %s. Używam %s.",
+        raw_log_level,
+        logging.getLevelName(LOG_LEVEL),
+    )
+
+logging.info("Logi zapisywane do pliku: %s", LOG_FILE_PATH)
+
+CLIENT_ID = CONFIG["client_id"]
+TENANT_ID = CONFIG["tenant_id"]
+CLIENT_SECRET = CONFIG["client_secret"]
+scopes_raw = CONFIG.get("scopes", DEFAULT_CONFIG["scopes"])
+SCOPES = _parse_scopes(scopes_raw)
+
+fallback_scopes = False
+if isinstance(scopes_raw, list):
+    fallback_scopes = not any(str(item).strip() for item in scopes_raw)
+elif isinstance(scopes_raw, str):
+    fallback_scopes = not scopes_raw.strip()
+else:
+    fallback_scopes = True
+
+if fallback_scopes:
+    logging.warning(
+        "Nieprawidłowa wartość scopes w pliku konfiguracyjnym. Używam domyślnej listy: %s.",
+        ", ".join(SCOPES),
+    )
+
+logging.debug("Zakresy uprawnień używane przez aplikację: %s", ", ".join(SCOPES))
+
+fetch_timeout_seconds = _get_float_setting("fetch_timeout_seconds")
+FETCH_TIMEOUT = aiohttp.ClientTimeout(total=fetch_timeout_seconds)
+
+RETRY_DELAY_SECONDS = _get_float_setting("retry_delay_seconds")
+
+THROTTLE_DELAY_SECONDS = _get_float_setting("throttle_delay_seconds")
+
+SEMAPHORE_LIMIT = _get_int_setting("semaphore_limit")
+if SEMAPHORE_LIMIT <= 0:
+    SEMAPHORE_LIMIT = DEFAULT_CONFIG["semaphore_limit"]
+
+logging.info("Używany plik konfiguracyjny: %s", CONFIG_PATH)
+logging.info(
+    "Ustawienia żądań: timeout=%ss, retry_delay=%ss, throttle_delay=%ss, limit=%s",
+    fetch_timeout_seconds,
+    RETRY_DELAY_SECONDS,
+    THROTTLE_DELAY_SECONDS,
+    SEMAPHORE_LIMIT,
+)
+
 
 def safe_int(value, default=0):
     if isinstance(value, bool):
@@ -77,6 +342,16 @@ def safe_int(value, default=0):
         return default
 
     return default
+
+
+def summarize_text(value, max_length=300):
+    if value is None:
+        return ""
+
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
 
 def extract_extended_message_size(message):
     for prop in message.get("singleValueExtendedProperties", []) or []:
@@ -133,21 +408,6 @@ def estimate_message_body_bytes(message):
 
     return total_bytes
 
-LOG_FILENAME = 'email_trend_app_only.log'
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)  # Zmiana na sys.stdout
-    ]
-)
-
-CLIENT_ID = ""
-TENANT_ID = ""
-CLIENT_SECRET = ""
-SCOPES = ["https://graph.microsoft.com/.default"]
-
 def get_access_token():
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     app = msal.ConfidentialClientApplication(
@@ -155,13 +415,28 @@ def get_access_token():
         authority=authority,
         client_credential=CLIENT_SECRET
     )
-    token_response = app.acquire_token_for_client(scopes=SCOPES)
+    try:
+        token_response = app.acquire_token_for_client(scopes=SCOPES)
+    except Exception as error:
+        logging.exception(
+            "Wyjątek podczas uzyskiwania tokena dostępu: %s",
+            summarize_text(error),
+        )
+        raise
+
     if "access_token" not in token_response:
-        raise Exception("Nie udało się uzyskać tokena: " + str(token_response))
+        error_details = summarize_text(token_response)
+        logging.error(
+            "Nie udało się uzyskać tokena dostępu dla tenant_id=%s: %s",
+            TENANT_ID,
+            error_details or "brak szczegółów",
+        )
+        raise Exception(f"Nie udało się uzyskać tokena: {error_details}")
     return token_response["access_token"]
 
 async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
     attempts_left = retries
+    last_error_summary = ""
     async with semaphore:
         while attempts_left > 0:
             try:
@@ -172,17 +447,35 @@ async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
+                        error_summary = summarize_text(error_text)
+                        logging.warning(
+                            "Błąd pobierania danych (%s) dla %s: %s",
+                            response.status,
+                            url,
+                            error_summary or "brak treści",
+                        )
                         if pbar:
                             pbar.write(
                                 f"Błąd pobierania danych: {response.status} {error_text}"
                             )
+                        last_error_summary = (
+                            f"{response.status} {error_summary}".strip()
+                            or last_error_summary
+                        )
                     else:
                         return await response.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                error_summary = summarize_text(e)
+                logging.warning(
+                    "Wyjątek podczas pobierania %s: %s",
+                    url,
+                    error_summary or f"{e.__class__.__name__}: {e}",
+                )
                 if pbar:
                     pbar.write(
                         f"Błąd połączenia: {e.__class__.__name__}: {e}"
                     )
+                last_error_summary = error_summary or f"{e.__class__.__name__}: {e}"
 
             attempts_left -= 1
             if attempts_left > 0:
@@ -190,11 +483,22 @@ async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
                     pbar.write(
                         f"Ponawianie próby pobierania danych... Pozostało prób: {attempts_left}"
                     )
+                logging.debug(
+                    "Ponawianie pobierania %s. Pozostało prób: %s",
+                    url,
+                    attempts_left,
+                )
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
                 await asyncio.sleep(THROTTLE_DELAY_SECONDS)
 
     if pbar:
         pbar.write("Nie udało się pobrać danych po wielu próbach.")
+    logging.error(
+        "Nie udało się pobrać danych z %s po %s próbach. Ostatni błąd: %s",
+        url,
+        retries,
+        last_error_summary or "brak szczegółów",
+    )
     return None
 
 async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
@@ -223,6 +527,11 @@ async def get_child_folders(session, token, mailbox_email, folder, semaphore, pa
     while child_url:
         data = await fetch(session, child_url, headers, semaphore, pbar=pbar)
         if not data:
+            logging.warning(
+                "Brak danych podfolderów dla %s w ścieżce %s.",
+                mailbox_email,
+                current_path or folder_name or folder_id,
+            )
             break
         children = data.get("value", [])
 
@@ -241,6 +550,11 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
     while url:
         data = await fetch(session, url, headers, semaphore, pbar=pbar)
         if not data:
+            logging.error(
+                "Nie udało się pobrać listy folderów dla %s (adres żądania: %s).",
+                mailbox_email,
+                url,
+            )
             raise Exception(f"Błąd pobierania folderów dla {mailbox_email}")
         top_folders = data.get("value", [])
 
@@ -291,6 +605,11 @@ async def get_messages_from_folder(session, token, mailbox_email, folder_id, pba
     while url:
         data = await fetch(session, url, headers, semaphore, retries, pbar)
         if not data:
+            logging.error(
+                "Brak danych wiadomości dla folderu %s w skrzynce %s.",
+                folder_id,
+                mailbox_email,
+            )
             break
 
         page_messages = data.get("value", [])
@@ -522,12 +841,12 @@ async def process_mailbox(session, mailbox, token, semaphore):
             for folder_meta, result in zip(folders, results):
                 folder_path = folder_meta["path"]
                 if isinstance(result, Exception):
+                    error_summary = summarize_text(result)
                     logging.warning(
-                        "Błąd pobierania folderu %s (%s): %s: %s. Ponawiam próbę...",
+                        "Błąd pobierania folderu %s (%s): %s. Ponawiam próbę...",
                         folder_path,
                         folder_meta.get("id"),
-                        result.__class__.__name__,
-                        result,
+                        error_summary or result.__class__.__name__,
                     )
                     try:
                         retry_messages = await get_messages_from_folder(
@@ -539,11 +858,11 @@ async def process_mailbox(session, mailbox, token, semaphore):
                             semaphore,
                         )
                     except Exception as retry_error:
+                        retry_summary = summarize_text(retry_error)
                         logging.error(
-                            "Nie udało się pobrać folderu %s po ponownej próbie: %s: %s",
+                            "Nie udało się pobrać folderu %s po ponownej próbie: %s",
                             folder_path,
-                            retry_error.__class__.__name__,
-                            retry_error,
+                            retry_summary or retry_error.__class__.__name__,
                         )
                         mailbox_data[folder_path] = []
                     else:
@@ -564,7 +883,7 @@ async def main():
     mailboxes_input = input("Podaj adresy skrzynek oddzielone przecinkiem: ").strip()
     mailbox_list = [m.strip() for m in mailboxes_input.split(",") if m.strip()]
 
-    semaphore = asyncio.Semaphore(7)  # Zwiększ liczbę jednoczesnych żądań
+    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
     async with aiohttp.ClientSession() as session:
         tasks = [process_mailbox(session, mailbox, token, semaphore) for mailbox in mailbox_list]
