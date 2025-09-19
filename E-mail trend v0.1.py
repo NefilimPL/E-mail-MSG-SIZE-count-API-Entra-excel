@@ -702,8 +702,28 @@ def export_to_excel(data, mailbox_email):
         default_sheet = wb["Sheet"]
         wb.remove(default_sheet)
 
+    used_sheet_names = set(wb.sheetnames)
+    sheet_name_counters = {}
+
+    def get_unique_sheet_name(base_name: str) -> str:
+        index = sheet_name_counters.get(base_name, 1)
+        while True:
+            if index == 1:
+                candidate = base_name
+            else:
+                suffix = f"_{index}"
+                allowed_length = max(31 - len(suffix), 0)
+                candidate = f"{base_name[:allowed_length]}{suffix}"
+            candidate = candidate[:31] or "Folder"
+            if candidate not in used_sheet_names:
+                used_sheet_names.add(candidate)
+                sheet_name_counters[base_name] = index + 1
+                return candidate
+            index += 1
+
     for folder_path, messages in data.items():
-        sheet_name = sanitize_sheet_name(folder_path)
+        base_name = sanitize_sheet_name(folder_path)
+        sheet_name = get_unique_sheet_name(base_name)
 
         ws = wb.create_sheet(title=sheet_name)
         ws.append([
@@ -778,7 +798,9 @@ def export_to_excel(data, mailbox_email):
                 month_label
             ])
 
-    summary_sheet = wb.create_sheet(title="Podsumowanie")
+    summary_base_name = "Podsumowanie"
+    summary_sheet_name = get_unique_sheet_name(summary_base_name)
+    summary_sheet = wb.create_sheet(title=summary_sheet_name)
     summary_sheet.append([
         "Mailbox",
         "Folder",
