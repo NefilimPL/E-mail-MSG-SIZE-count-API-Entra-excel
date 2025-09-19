@@ -44,16 +44,28 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILENAME = "email_trend_config.json"
 CONFIG_PATH = os.path.join(SCRIPT_DIR, CONFIG_FILENAME)
 
+# Domyślne wartości używane przy generowaniu pliku konfiguracyjnego.
+# Każdy klucz można nadpisać w `email_trend_config.json`.
 DEFAULT_CONFIG = {
+    # Identyfikator aplikacji (Client ID) zarejestrowanej w Entra ID.
     "client_id": "",
+    # Identyfikator dzierżawy (Tenant ID), w której zarejestrowana jest aplikacja.
     "tenant_id": "",
+    # Sekret klienta (Client Secret) używany do uwierzytelnienia aplikacji.
     "client_secret": "",
+    # Lista zakresów uprawnień przekazywana do Microsoft Graph.
     "scopes": ["https://graph.microsoft.com/.default"],
+    # Lokalizacja i nazwa pliku logów.
     "log_filename": "email_trend_app_only.log",
+    # Poziom szczegółowości logów (np. DEBUG, INFO, WARNING).
     "log_level": "INFO",
+    # Limit czasu na pobranie danych pojedynczego żądania w sekundach.
     "fetch_timeout_seconds": 30,
+    # Opóźnienie między ponownymi próbami w sekundach po wystąpieniu błędu.
     "retry_delay_seconds": 5,
+    # Dodatkowe opóźnienie między kolejnymi żądaniami w sekundach (throttling).
     "throttle_delay_seconds": 1,
+    # Maksymalna liczba równoległych żądań wysyłanych do Graph API.
     "semaphore_limit": 7,
 }
 
