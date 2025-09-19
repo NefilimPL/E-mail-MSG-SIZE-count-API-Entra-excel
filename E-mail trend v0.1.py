@@ -3,6 +3,7 @@ import sys
 import subprocess
 import asyncio
 import re
+import math
 import datetime
 from collections import defaultdict
 from urllib.parse import quote
@@ -33,18 +34,104 @@ check_modules()
 
 import aiohttp
 
+
+FETCH_TIMEOUT = aiohttp.ClientTimeout(total=30)
+RETRY_DELAY_SECONDS = 5
+THROTTLE_DELAY_SECONDS = 1
+
 def safe_int(value, default=0):
-    try:
+    if isinstance(value, bool):
         return int(value)
-    except (TypeError, ValueError):
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return int(value)
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return default
+
+        cleaned = (
+            cleaned.replace(" ", "")
+            .replace("\u00a0", "")
+            .replace(",", ".")
+        )
+
+        try:
+            return int(cleaned)
+        except ValueError:
+            try:
+                return int(float(cleaned))
+            except ValueError:
+                match = re.search(r"-?\d+", cleaned)
+                if match:
+                    try:
+                        return int(match.group(0))
+                    except ValueError:
+                        return default
         return default
+
+    return default
 
 def extract_extended_message_size(message):
     for prop in message.get("singleValueExtendedProperties", []) or []:
         prop_id = (prop.get("id") or "").lower()
-        if prop_id == "integer 0x0e08":
-            return safe_int(prop.get("value"))
+        if prop_id in {"integer 0x0e08", "long 0x0e08"}:
+            size_value = safe_int(prop.get("value"))
+            if size_value:
+                return size_value
     return 0
+
+
+def encoded_length(value):
+    if not value:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    return len(str(value).encode("utf-8", errors="ignore"))
+
+
+def estimate_message_body_bytes(message):
+    total_bytes = 0
+
+    headers = message.get("internetMessageHeaders") or []
+    if headers:
+        for header in headers:
+            name = header.get("name") or ""
+            value = header.get("value") or ""
+            total_bytes += encoded_length(f"{name}: {value}\r\n")
+    else:
+        subject = message.get("subject")
+        if subject:
+            total_bytes += encoded_length(f"Subject: {subject}\r\n")
+
+        sender = message.get("from", {}).get("emailAddress", {}).get("address", "")
+        if sender:
+            total_bytes += encoded_length(f"From: {sender}\r\n")
+
+        for field in ("toRecipients", "ccRecipients", "bccRecipients"):
+            recipients = message.get(field) or []
+            if not isinstance(recipients, list):
+                continue
+            label = field.replace("Recipients", "").upper() or "TO"
+            for recipient in recipients:
+                address = recipient.get("emailAddress", {}).get("address", "")
+                if address:
+                    total_bytes += encoded_length(f"{label}: {address}\r\n")
+
+    body = message.get("body") or {}
+    body_content = body.get("content") or ""
+    total_bytes += encoded_length(body_content)
+
+    if total_bytes == 0:
+        total_bytes = encoded_length(message.get("bodyPreview"))
+
+    return total_bytes
 
 LOG_FILENAME = 'email_trend_app_only.log'
 logging.basicConfig(
@@ -74,63 +161,41 @@ def get_access_token():
     return token_response["access_token"]
 
 async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
+    attempts_left = retries
     async with semaphore:
-        while retries > 0:
+        while attempts_left > 0:
             try:
-                async with session.get(url, headers=headers, timeout=10) as response:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=FETCH_TIMEOUT,
+                ) as response:
                     if response.status != 200:
+                        error_text = await response.text()
                         if pbar:
-                            pbar.write(f"Błąd pobierania danych: {response.status} {await response.text()}")
-                        retries -= 1
-                        if pbar:
-                            pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {retries}")
-                        await asyncio.sleep(5)
-                        continue
-                    return await response.json()
-            except aiohttp.ClientError as e:
+                            pbar.write(
+                                f"Błąd pobierania danych: {response.status} {error_text}"
+                            )
+                    else:
+                        return await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if pbar:
-                    pbar.write(f"Błąd połączenia: {e}")
-                retries -= 1
-                if pbar:
-                    pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {retries}")
-                await asyncio.sleep(5)
-            await asyncio.sleep(1)  # Dodaj opóźnienie między żądaniami
-    return None
+                    pbar.write(
+                        f"Błąd połączenia: {e.__class__.__name__}: {e}"
+                    )
 
-async def fetch_with_error(session, url, headers, semaphore, retries=3, pbar=None):
-    async with semaphore:
-        attempts = retries
-        while attempts > 0:
-            try:
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        return await response.json(), None
-                    error_body = await response.text()
-                    if pbar:
-                        pbar.write(f"Błąd pobierania danych: {response.status} {error_body}")
-                    if response.status == 400:
-                        return None, {"status": response.status, "body": error_body}
-                    attempts -= 1
-                    if attempts > 0:
-                        if pbar:
-                            pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {attempts}")
-                        await asyncio.sleep(5)
-                        await asyncio.sleep(1)
-                        continue
-                    return None, {"status": response.status, "body": error_body}
-            except aiohttp.ClientError as e:
+            attempts_left -= 1
+            if attempts_left > 0:
                 if pbar:
-                    pbar.write(f"Błąd połączenia: {e}")
-                attempts -= 1
-                if attempts > 0:
-                    if pbar:
-                        pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {attempts}")
-                    await asyncio.sleep(5)
-                    await asyncio.sleep(1)
-                    continue
-                return None, {"status": None, "body": str(e)}
-            await asyncio.sleep(1)
-    return None, {"status": None, "body": None}
+                    pbar.write(
+                        f"Ponawianie próby pobierania danych... Pozostało prób: {attempts_left}"
+                    )
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+                await asyncio.sleep(THROTTLE_DELAY_SECONDS)
+
+    if pbar:
+        pbar.write("Nie udało się pobrać danych po wielu próbach.")
+    return None
 
 async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
     headers = {"Authorization": f"Bearer {token}"}
@@ -187,67 +252,87 @@ async def get_all_folders(session, token, mailbox_email, semaphore, pbar=None):
     return all_folders
 
 async def get_messages_from_folder(session, token, mailbox_email, folder_id, pbar, semaphore, retries=3):
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.body-content-type="html"',
+    }
     base_url = (
         "https://graph.microsoft.com/v1.0/users/"
         f"{mailbox_email}/mailFolders/{folder_id}/messages"
     )
-    attachments_expand = "attachments($select=size)"
-    extended_filter = quote("id eq 'Integer 0x0E08'", safe="")
+    attachments_expand = "attachments($select=size,isInline)"
+    extended_filter = quote("id eq 'Integer 0x0E08' or id eq 'Long 0x0E08'", safe="")
 
-    def build_url():
-        select_parts = [
-            "subject",
-            "receivedDateTime",
-            "hasAttachments",
-            "id",
-            "from",
-            "singleValueExtendedProperties",
-        ]
-        expand_parts = [
+    select_parts = [
+        "subject",
+        "receivedDateTime",
+        "hasAttachments",
+        "id",
+        "from",
+        "body",
+        "bodyPreview",
+        "internetMessageHeaders",
+        "singleValueExtendedProperties",
+        "toRecipients",
+        "ccRecipients",
+        "bccRecipients",
+    ]
+    select_clause = ",".join(select_parts)
+    expand_clause = ",".join(
+        [
             attachments_expand,
             f"singleValueExtendedProperties($filter={extended_filter})",
         ]
-        select_clause = ",".join(select_parts)
-        expand_clause = ",".join(expand_parts)
-        return f"{base_url}?$select={select_clause}&$expand={expand_clause}&$top=100"
+    )
 
-    url = build_url()
-    size_warning_logged = False
+    url = f"{base_url}?$select={select_clause}&$expand={expand_clause}&$top=100"
     messages = []
 
     while url:
-        data, error = await fetch_with_error(session, url, headers, semaphore, retries, pbar)
+        data = await fetch(session, url, headers, semaphore, retries, pbar)
         if not data:
-            error_body = ((error or {}).get("body") or "").lower()
-            if (
-                (error or {}).get("status") == 400
-                and "property named 'size'" in error_body
-                and not size_warning_logged
-            ):
-                logging.warning(
-                    "API Graph odrzuciło właściwość size dla skrzynki %s. "
-                    "Wszystkie rozmiary wiadomości będą pobierane z rozszerzonej właściwości PR_MESSAGE_SIZE.",
-                    mailbox_email,
-                )
-                size_warning_logged = True
             break
 
         page_messages = data.get("value", [])
         for msg in page_messages:
             attachments = msg.get("attachments", []) or []
-            attachment_size = sum(safe_int(att.get("size")) for att in attachments)
-            msg["attachment_size"] = attachment_size
+            regular_attachment_size = 0
+            inline_attachment_size = 0
 
-            message_size = extract_extended_message_size(msg)
-            if message_size <= 0:
-                message_size = safe_int(msg.get("size"))
-            if message_size <= 0:
-                message_size = attachment_size
-            msg["size"] = message_size
+            for att in attachments:
+                att_size = safe_int(att.get("size"))
+                if not att_size:
+                    continue
+                if att.get("isInline"):
+                    inline_attachment_size += att_size
+                else:
+                    regular_attachment_size += att_size
+
+            msg["attachment_size"] = regular_attachment_size
+
+            estimated_body = estimate_message_body_bytes(msg)
+            extended_total = extract_extended_message_size(msg)
+            baseline_body = estimated_body + inline_attachment_size
+            baseline_total = regular_attachment_size + baseline_body
+
+            if extended_total > 0:
+                total_size = max(extended_total, baseline_total)
+                body_size = max(total_size - regular_attachment_size, baseline_body)
+            else:
+                body_size = baseline_body
+                total_size = baseline_total
+
+            msg["body_size"] = body_size
+            msg["total_size"] = total_size
 
             msg.pop("attachments", None)
             msg.pop("singleValueExtendedProperties", None)
+            msg.pop("internetMessageHeaders", None)
+            msg.pop("body", None)
+            msg.pop("bodyPreview", None)
+            msg.pop("toRecipients", None)
+            msg.pop("ccRecipients", None)
+            msg.pop("bccRecipients", None)
 
         messages.extend(page_messages)
         pbar.update(len(page_messages))
@@ -260,11 +345,21 @@ def sanitize_sheet_name(name: str) -> str:
     return cleaned[:31] or "Folder"
 
 def build_monthly_summary(mailbox_data):
-    summary = defaultdict(lambda: {"message_count": 0, "message_size": 0, "attachment_size": 0})
+    summary = defaultdict(
+        lambda: {
+            "message_count": 0,
+            "body_size": 0,
+            "attachment_size": 0,
+            "total_size": 0,
+        }
+    )
     for folder_path, messages in mailbox_data.items():
         for msg in messages:
-            size_bytes = safe_int(msg.get("size", 0))
+            body_bytes = safe_int(msg.get("body_size", 0))
             attachment_bytes = safe_int(msg.get("attachment_size", 0))
+            total_bytes = safe_int(
+                msg.get("total_size", body_bytes + attachment_bytes)
+            )
             received_dt = msg.get("receivedDateTime")
             month_key = "Nieznany"
             if received_dt:
@@ -276,8 +371,9 @@ def build_monthly_summary(mailbox_data):
                     month_key = received_dt[:7]
 
             summary[(folder_path, month_key)]["message_count"] += 1
-            summary[(folder_path, month_key)]["message_size"] += size_bytes
+            summary[(folder_path, month_key)]["body_size"] += body_bytes
             summary[(folder_path, month_key)]["attachment_size"] += attachment_bytes
+            summary[(folder_path, month_key)]["total_size"] += total_bytes
 
     return summary
 
@@ -294,12 +390,15 @@ def export_to_excel(data, mailbox_email):
         ws.append([
             "Subject",
             "Sender",
-            "Size (bytes)",
-            "Size (KB)",
-            "Size (MB)",
+            "Message Size (bytes)",
+            "Message Size (KB)",
+            "Message Size (MB)",
             "Attachment Size (bytes)",
             "Attachment Size (KB)",
             "Attachment Size (MB)",
+            "Total Size (bytes)",
+            "Total Size (KB)",
+            "Total Size (MB)",
             "Has Attachments",
             "Received Date",
             "Received Time",
@@ -310,13 +409,17 @@ def export_to_excel(data, mailbox_email):
             subject = msg.get("subject")
             sender = msg.get("from", {}).get("emailAddress", {}).get("address", "")
 
-            size_bytes = safe_int(msg.get("size", 0))
-            size_kb = round(size_bytes / 1024, 2)
-            size_mb = round(size_bytes / (1024 * 1024), 2)
+            body_bytes = safe_int(msg.get("body_size", 0))
+            body_kb = round(body_bytes / 1024, 2)
+            body_mb = round(body_bytes / (1024 * 1024), 2)
 
             attach_bytes = safe_int(msg.get("attachment_size", 0))
             attach_kb = round(attach_bytes / 1024, 2)
             attach_mb = round(attach_bytes / (1024 * 1024), 2)
+
+            total_bytes = safe_int(msg.get("total_size", body_bytes + attach_bytes))
+            total_kb = round(total_bytes / 1024, 2)
+            total_mb = round(total_bytes / (1024 * 1024), 2)
 
             has_attachments = "Yes" if attach_bytes > 0 else "No"
 
@@ -341,12 +444,15 @@ def export_to_excel(data, mailbox_email):
             ws.append([
                 subject,
                 sender,
-                size_bytes,
-                size_kb,
-                size_mb,
+                body_bytes,
+                body_kb,
+                body_mb,
                 attach_bytes,
                 attach_kb,
                 attach_mb,
+                total_bytes,
+                total_kb,
+                total_mb,
                 has_attachments,
                 received_date,
                 received_time,
@@ -359,24 +465,29 @@ def export_to_excel(data, mailbox_email):
         "Folder",
         "Month",
         "Message Count",
-        "Total Size (bytes)",
+        "Total Size (KB)",
+        "Message Size (KB)",
+        "Attachment Size (KB)",
         "Total Size (MB)",
-        "Attachment Size (bytes)",
+        "Message Size (MB)",
         "Attachment Size (MB)"
     ])
 
     summary_data = build_monthly_summary(data)
     for (folder_path, month_key), values in sorted(summary_data.items(), key=lambda x: (x[0][0], x[0][1])):
-        total_size_bytes = values["message_size"]
-        attachment_size_bytes = values["attachment_size"]
+        total_size_bytes = safe_int(values.get("total_size", 0))
+        body_size_bytes = safe_int(values.get("body_size", 0))
+        attachment_size_bytes = safe_int(values.get("attachment_size", 0))
         summary_sheet.append([
             mailbox_email,
             folder_path,
             month_key,
             values["message_count"],
-            total_size_bytes,
+            round(total_size_bytes / 1024, 2),
+            round(body_size_bytes / 1024, 2),
+            round(attachment_size_bytes / 1024, 2),
             round(total_size_bytes / (1024 * 1024), 2),
-            attachment_size_bytes,
+            round(body_size_bytes / (1024 * 1024), 2),
             round(attachment_size_bytes / (1024 * 1024), 2)
         ])
 
@@ -396,14 +507,54 @@ async def process_mailbox(session, mailbox, token, semaphore):
 
             mailbox_data = {}
 
-            tasks = [get_messages_from_folder(session, token, mailbox, f["id"], pbar, semaphore) for f in folders]
-            results = await asyncio.gather(*tasks)
-            for f, messages in zip(folders, results):
-                mailbox_data[f["path"]] = messages
+            tasks = [
+                get_messages_from_folder(
+                    session,
+                    token,
+                    mailbox,
+                    f["id"],
+                    pbar,
+                    semaphore,
+                )
+                for f in folders
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for folder_meta, result in zip(folders, results):
+                folder_path = folder_meta["path"]
+                if isinstance(result, Exception):
+                    logging.warning(
+                        "Błąd pobierania folderu %s (%s): %s: %s. Ponawiam próbę...",
+                        folder_path,
+                        folder_meta.get("id"),
+                        result.__class__.__name__,
+                        result,
+                    )
+                    try:
+                        retry_messages = await get_messages_from_folder(
+                            session,
+                            token,
+                            mailbox,
+                            folder_meta["id"],
+                            pbar,
+                            semaphore,
+                        )
+                    except Exception as retry_error:
+                        logging.error(
+                            "Nie udało się pobrać folderu %s po ponownej próbie: %s: %s",
+                            folder_path,
+                            retry_error.__class__.__name__,
+                            retry_error,
+                        )
+                        mailbox_data[folder_path] = []
+                    else:
+                        mailbox_data[folder_path] = retry_messages or []
+                    continue
+
+                mailbox_data[folder_path] = result or []
 
             export_to_excel(mailbox_data, mailbox)
-    except Exception as e:
-        logging.error(f"Błąd przetwarzania skrzynki {mailbox}: {str(e)}")
+    except Exception:
+        logging.exception("Błąd przetwarzania skrzynki %s", mailbox)
 
 async def main():
     logging.info("Rozpoczynam pobieranie danych (app-only)...")
