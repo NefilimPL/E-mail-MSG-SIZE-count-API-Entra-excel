@@ -326,17 +326,36 @@ class RequestThrottler:
         self._lock = asyncio.Lock()
         self._next_available_time = 0.0
         self._cooldown_until = 0.0
+        self._waiters = []
 
     async def _reserve_window(self):
         loop = asyncio.get_running_loop()
-        async with self._lock:
-            now = loop.time()
-            wait_until = max(self._next_available_time, self._cooldown_until)
-            wait_time = max(0.0, wait_until - now)
-            scheduled_from = max(now, wait_until)
-            self._next_available_time = scheduled_from + self._base_interval
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
+        waiter = _PendingWaiter(0.0)
+        try:
+            async with self._lock:
+                now = loop.time()
+                scheduled_from = max(
+                    now, self._next_available_time, self._cooldown_until
+                )
+                waiter.deadline = scheduled_from
+                self._next_available_time = scheduled_from + self._base_interval
+                self._waiters.append(waiter)
+
+            while True:
+                now = loop.time()
+                remaining = waiter.deadline - now
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(waiter.event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                else:
+                    waiter.event.clear()
+        finally:
+            async with self._lock:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
 
     @asynccontextmanager
     async def slot(self):
@@ -358,7 +377,36 @@ class RequestThrottler:
         loop = asyncio.get_running_loop()
         async with self._lock:
             now = loop.time()
-            self._cooldown_until = max(self._cooldown_until, now + wait_value)
+            new_cooldown_until = max(self._cooldown_until, now + wait_value)
+            if new_cooldown_until <= self._cooldown_until:
+                return
+
+            delta = 0.0
+            if self._waiters:
+                earliest_deadline = min(waiter.deadline for waiter in self._waiters)
+                if earliest_deadline < new_cooldown_until:
+                    delta = new_cooldown_until - earliest_deadline
+                    for waiter in self._waiters:
+                        waiter.deadline += delta
+                    self._next_available_time += delta
+            else:
+                self._next_available_time = max(
+                    self._next_available_time, new_cooldown_until
+                )
+
+            self._cooldown_until = new_cooldown_until
+            waiters_to_wake = list(self._waiters) if delta > 0 else []
+
+        for waiter in waiters_to_wake:
+            waiter.event.set()
+
+
+class _PendingWaiter:
+    __slots__ = ("deadline", "event")
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.event = asyncio.Event()
 
 
 class _ThrottleToken:
