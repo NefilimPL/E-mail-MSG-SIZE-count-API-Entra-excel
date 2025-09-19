@@ -8,21 +8,21 @@ import json
 import datetime
 from collections import defaultdict
 from urllib.parse import quote
-import msal
-import openpyxl
-from tqdm import tqdm
 import logging
 
-required_modules = ["requests", "msal", "openpyxl", "tqdm", "logging", "aiohttp"]
+required_modules = ["requests", "msal", "openpyxl", "tqdm", "aiohttp"]
+
 
 def install_and_restart():
+    python_executable = sys.executable.replace("pythonw.exe", "python.exe")
     try:
-        subprocess.check_call([sys.executable.replace('pythonw.exe', 'python.exe'), "-m", "pip", "install"] + required_modules)
+        subprocess.check_call([python_executable, "-m", "pip", "install"] + required_modules)
         print("Zainstalowano brakujące moduły. Restartowanie skryptu...")
-        os.execv(sys.executable.replace('pythonw.exe', 'python.exe'), ['python'] + sys.argv)
+        os.execv(python_executable, [python_executable] + sys.argv)
     except subprocess.CalledProcessError as e:
         print(f"Błąd podczas instalacji modułów: {e}")
         sys.exit(1)
+
 
 def check_modules():
     for module in required_modules:
@@ -31,8 +31,12 @@ def check_modules():
         except ImportError:
             install_and_restart()
 
+
 check_modules()
 
+import msal
+import openpyxl
+from tqdm import tqdm
 import aiohttp
 
 
