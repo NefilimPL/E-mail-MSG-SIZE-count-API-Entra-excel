@@ -34,6 +34,11 @@ check_modules()
 
 import aiohttp
 
+
+FETCH_TIMEOUT = aiohttp.ClientTimeout(total=30)
+RETRY_DELAY_SECONDS = 5
+THROTTLE_DELAY_SECONDS = 1
+
 def safe_int(value, default=0):
     if isinstance(value, bool):
         return int(value)
@@ -156,27 +161,40 @@ def get_access_token():
     return token_response["access_token"]
 
 async def fetch(session, url, headers, semaphore, retries=3, pbar=None):
+    attempts_left = retries
     async with semaphore:
-        while retries > 0:
+        while attempts_left > 0:
             try:
-                async with session.get(url, headers=headers, timeout=10) as response:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=FETCH_TIMEOUT,
+                ) as response:
                     if response.status != 200:
+                        error_text = await response.text()
                         if pbar:
-                            pbar.write(f"Błąd pobierania danych: {response.status} {await response.text()}")
-                        retries -= 1
-                        if pbar:
-                            pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {retries}")
-                        await asyncio.sleep(5)
-                        continue
-                    return await response.json()
-            except aiohttp.ClientError as e:
+                            pbar.write(
+                                f"Błąd pobierania danych: {response.status} {error_text}"
+                            )
+                    else:
+                        return await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if pbar:
-                    pbar.write(f"Błąd połączenia: {e}")
-                retries -= 1
+                    pbar.write(
+                        f"Błąd połączenia: {e.__class__.__name__}: {e}"
+                    )
+
+            attempts_left -= 1
+            if attempts_left > 0:
                 if pbar:
-                    pbar.write(f"Ponawianie próby pobierania danych... Pozostało prób: {retries}")
-                await asyncio.sleep(5)
-            await asyncio.sleep(1)  # Dodaj opóźnienie między żądaniami
+                    pbar.write(
+                        f"Ponawianie próby pobierania danych... Pozostało prób: {attempts_left}"
+                    )
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+                await asyncio.sleep(THROTTLE_DELAY_SECONDS)
+
+    if pbar:
+        pbar.write("Nie udało się pobrać danych po wielu próbach.")
     return None
 
 async def get_child_folders(session, token, mailbox_email, folder, semaphore, path="", pbar=None):
@@ -500,13 +518,43 @@ async def process_mailbox(session, mailbox, token, semaphore):
                 )
                 for f in folders
             ]
-            results = await asyncio.gather(*tasks)
-            for f, messages in zip(folders, results):
-                mailbox_data[f["path"]] = messages
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for folder_meta, result in zip(folders, results):
+                folder_path = folder_meta["path"]
+                if isinstance(result, Exception):
+                    logging.warning(
+                        "Błąd pobierania folderu %s (%s): %s: %s. Ponawiam próbę...",
+                        folder_path,
+                        folder_meta.get("id"),
+                        result.__class__.__name__,
+                        result,
+                    )
+                    try:
+                        retry_messages = await get_messages_from_folder(
+                            session,
+                            token,
+                            mailbox,
+                            folder_meta["id"],
+                            pbar,
+                            semaphore,
+                        )
+                    except Exception as retry_error:
+                        logging.error(
+                            "Nie udało się pobrać folderu %s po ponownej próbie: %s: %s",
+                            folder_path,
+                            retry_error.__class__.__name__,
+                            retry_error,
+                        )
+                        mailbox_data[folder_path] = []
+                    else:
+                        mailbox_data[folder_path] = retry_messages or []
+                    continue
+
+                mailbox_data[folder_path] = result or []
 
             export_to_excel(mailbox_data, mailbox)
-    except Exception as e:
-        logging.error(f"Błąd przetwarzania skrzynki {mailbox}: {str(e)}")
+    except Exception:
+        logging.exception("Błąd przetwarzania skrzynki %s", mailbox)
 
 async def main():
     logging.info("Rozpoczynam pobieranie danych (app-only)...")
