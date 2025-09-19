@@ -14,7 +14,7 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
 1. Uruchomić skrypt (`python "E-mail trend v0.1.py"`).
 2. Po pierwszym uruchomieniu pojawi się plik `email_trend_config.json`.
 3. Uzupełnić pola `client_id`, `tenant_id` oraz `client_secret` danymi z aplikacji w Entra ID.
-4. Opcjonalnie dopasować pozostałe ustawienia (zakresy uprawnień, poziom logowania, limity czasowe, liczbę równoległych zapytań).
+4. Opcjonalnie dopasować pozostałe ustawienia (zakresy uprawnień, poziom logowania, limity czasowe, liczbę równoległych zapytań i rozmiar paczek folderów).
 5. Zapisać zmiany i ponownie uruchomić skrypt.
 
 ### Przykładowa struktura pliku `email_trend_config.json`
@@ -32,7 +32,8 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
   "fetch_timeout_seconds": 30,
   "retry_delay_seconds": 5,
   "throttle_delay_seconds": 1,
-  "semaphore_limit": 7
+  "semaphore_limit": 7,
+  "max_folder_batch_size": 3
 }
 ```
 
@@ -46,6 +47,7 @@ Skrypt automatycznie sprawdza obecność pliku `email_trend_config.json` w tym s
 6. **Obsługa błędów** – operacje sieciowe mają wbudowane ponawianie (`retry_delay_seconds`) i limit czasu (`fetch_timeout_seconds`). Każda nieudana próba jest logowana, a skrócone komunikaty błędów pozwalają szybko znaleźć przyczynę problemu.
 7. **Eksport do Excela** – po zebraniu wszystkich wiadomości dane zapisywane są do pliku `.xlsx`. Powstaje osobna karta dla każdego folderu (z listą wiadomości i rozmiarami) oraz karta `Podsumowanie`, która agreguje liczbę wiadomości i łączny rozmiar miesięcznie dla każdego folderu.
 8. **Informacje pomocnicze** – pasek postępu (`tqdm`) pokazuje liczbę przetworzonych wiadomości, a logi zapisywane są zarówno do pliku jak i na standardowe wyjście, co ułatwia nadzór nad działaniem narzędzia.
+
 
 ### Logowanie
 
